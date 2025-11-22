@@ -1,0 +1,9 @@
+log.diff
+my_gcc.*
+my_log.txt
+output.diff
+
+procsim.dSYM/
+procsim.dSYM/Contents/Resources/DWARF/procsim
+procsim
+log2.diff

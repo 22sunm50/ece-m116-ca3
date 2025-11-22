@@ -7,7 +7,15 @@
 
 // =============== DEBUG FLAG ===============
 // Set this to false before submitting to Gradescope
+// static const bool DEBUG_PRINT = false;
+
+// #define LOCAL_DEBUG 1   // uncomment when debugging locally
+
+#ifdef LOCAL_DEBUG
+static const bool DEBUG_PRINT = true;
+#else
 static const bool DEBUG_PRINT = false;
+#endif
 
 // =============== Global configuration ===============
 static uint64_t g_R  = DEFAULT_R;
@@ -33,6 +41,8 @@ static std::deque<proc_inst_t*> g_fetch_latch;
 // Reservation Station (RS): centralized RS+ROB
 static std::vector<proc_inst_t*> g_rs;
 
+static std::vector<proc_inst_t*> g_all_insts;  // all dynamic insts, in tag order
+
 // Per-register readiness (0..127)
 struct RegState {
     bool     ready;
@@ -55,9 +65,18 @@ static uint64_t g_total_fired     = 0;   // total instructions issued to FUs
 
 // =============== Helpers ===============
 
+static inline void log_event(const char* op, uint64_t tag) {
+    if (!DEBUG_PRINT) return;
+    std::fprintf(stderr, "%lu\t%s\t%lu\n",
+                 (unsigned long)g_cycle,
+                 op,
+                 (unsigned long)tag);
+}
+
 static proc_inst_t* alloc_inst(const proc_inst_t& base)
 {
     proc_inst_t* p = new proc_inst_t;
+    g_all_insts.push_back(p);
 
     // Copy fields read from trace
     p->instruction_address = base.instruction_address;
@@ -168,7 +187,7 @@ void setup_proc(uint64_t r, uint64_t k0, uint64_t k1, uint64_t k2, uint64_t f)
 
     if (DEBUG_PRINT) {
         // Match style of provided log
-        printf("CYCLE\tOPERATION\tINSTRUCTION\n");
+        std::fprintf(stderr, "CYCLE\tOPERATION\tINSTRUCTION\n");
     }
 }
 
@@ -179,7 +198,6 @@ void run_proc(proc_stats_t* p_stats)
     bool more_instructions = true;
     bool done              = false;
 
-    // Initialize stats fields
     p_stats->avg_inst_retired   = 0.0f;
     p_stats->avg_inst_fired     = 0.0f;
     p_stats->avg_disp_size      = 0.0f;
@@ -193,33 +211,13 @@ void run_proc(proc_stats_t* p_stats)
         size_t fired_this_cycle   = 0;
         size_t retired_this_cycle = 0;
 
-        // =========================
-        // 1) FU progress: decrement latency and mark completions
-        // =========================
-        for (size_t i = 0; i < g_fu_units.size(); ++i) {
-            FuUnit &fu = g_fu_units[i];
-            if (fu.busy && fu.inst != nullptr) {
-                if (fu.remaining_cycles > 0) {
-                    fu.remaining_cycles--;
-                    if (fu.remaining_cycles == 0) {
-                        // FU finished this cycle (instruction EXEC stage done)
-                        fu.inst->completed        = true;
-                        fu.inst->completion_cycle = g_cycle;
-                        if (DEBUG_PRINT) {
-                            printf("%lu\tEXECUTED\t%lu\n",
-                                   (unsigned long)g_cycle,
-                                   (unsigned long)fu.inst->tag);
-                        }
-                    }
-                }
-            }
-        }
+        // // =========================
+        // // FIRST HALF OF CYCLE
+        // // =========================
+        
+        // 1) Result buses (CDB) - first half
+        //    Broadcast results, update register file, free FUs
 
-        // =========================
-        // 2) Result buses (CDB) + mark ready + free FUs
-        //    - choose among all completed-but-not-yet-broadcast instructions
-        //    - priority: older completion_cycle, then lower tag
-        // =========================
         std::vector<proc_inst_t*> cdb_candidates;
 
         for (size_t i = 0; i < g_fu_units.size(); ++i) {
@@ -249,28 +247,17 @@ void run_proc(proc_stats_t* p_stats)
                 inst->state_cycle = g_cycle;
             }
 
-            // Update register file for dest reg
+            // Update register file for dest reg (first half)
             if (inst->dest_reg >= 0 && inst->dest_reg < 128) {
                 int d = inst->dest_reg;
-                // Only mark ready if this inst is the current producer
                 if (g_reg[d].producer_tag == inst->tag) {
                     g_reg[d].ready = true;
                 }
             }
 
-            // Update RS: mark dependent source operands as ready
-            for (proc_inst_t* rs_inst : g_rs) {
-                for (int s = 0; s < 2; ++s) {
-                    if (!rs_inst->src_ready[s] &&
-                        rs_inst->src_tag[s] == inst->tag) {
-                        rs_inst->src_ready[s] = true;
-                    }
-                }
-            }
-
             broadcasted_this_cycle.push_back(inst);
 
-            // Free FU that held this instruction
+            // Free FU (first half)
             if (inst->fu_index >= 0 &&
                 inst->fu_index < (int)g_fu_units.size()) {
                 FuUnit &fu = g_fu_units[inst->fu_index];
@@ -281,79 +268,100 @@ void run_proc(proc_stats_t* p_stats)
             }
         }
 
-        // Mark these instructions as in "state update" this cycle
-        for (proc_inst_t* inst : broadcasted_this_cycle) {
-            inst->ready_to_retire = true;
-            if (DEBUG_PRINT) {
-                printf("%lu\tSTATE UPDATE\t%lu\n",
-                       (unsigned long)g_cycle,
-                       (unsigned long)inst->tag);
-            }
-        }
-
-        // =========================
-        // 3) Issue from RS to FUs (Scheduling -> Execute)
-        //    - after CDB so newly freed FUs and ready operands can issue
-        // =========================
+        // 2) Issue from RS to FUs (first half)
+        //    Instructions become eligible if they entered sched BEFORE this cycle
+        //    With latency=1, instructions execute in the SAME cycle they are issued
         std::vector<proc_inst_t*> issue_candidates;
-        issue_candidates.reserve(g_rs.size());
 
         for (proc_inst_t* inst : g_rs) {
             if (!inst->issued &&
                 inst->sched_cycle > 0 &&
-                inst->sched_cycle < g_cycle &&        // at least 1 full cycle in sched
+                inst->sched_cycle < g_cycle &&  // must spend at least one full cycle in SCHED
                 inst->src_ready[0] && inst->src_ready[1]) {
                 issue_candidates.push_back(inst);
             }
         }
 
         std::sort(issue_candidates.begin(), issue_candidates.end(),
-                  [](const proc_inst_t* a, const proc_inst_t* b) {
-                      return a->tag < b->tag;
-                  });
+                [](const proc_inst_t* a, const proc_inst_t* b) {
+                    return a->tag < b->tag;   // issue in tag order
+                });
+
+        // Track which FU each inst went to this cycle
+        std::vector<std::pair<int, proc_inst_t*>> issued_this_cycle;  // (fu_index, inst)
 
         for (proc_inst_t* inst : issue_candidates) {
             int fu_idx = find_free_fu(inst->fu_type);
             if (fu_idx < 0) {
-                continue; // no FU of this type available this cycle
+                continue; // no FU of this type available
             }
 
             FuUnit &fu = g_fu_units[fu_idx];
             fu.busy             = true;
             fu.inst             = inst;
-            fu.remaining_cycles = 1;    // latency 1
+            fu.remaining_cycles = 0;      // latency 1, treated as "done" this cycle
             inst->issued        = true;
             inst->exec_cycle    = g_cycle;
             inst->fu_index      = fu_idx;
 
+            // mark as completed immediately; CDB will see it next cycle
+            inst->completed        = true;
+            inst->completion_cycle = g_cycle;
+
+            issued_this_cycle.emplace_back(fu_idx, inst);
             fired_this_cycle++;
         }
 
         g_total_fired += fired_this_cycle;
 
+        // Now log EXECUTED events in FU index order
+        if (DEBUG_PRINT) {
+            std::sort(issued_this_cycle.begin(), issued_this_cycle.end(),
+                    [](const std::pair<int, proc_inst_t*>& a,
+                        const std::pair<int, proc_inst_t*>& b) {
+                        return a.first < b.first;   // FU index order
+                    });
+            for (auto &p : issued_this_cycle) {
+                log_event("EXECUTED", p.second->tag);
+            }
+        }
+
         // =========================
-        // 4) Move from Dispatch queue -> RS (Scheduling stage)
-        //    - scan dispatch in program order
-        //    - obey RS capacity
-        //    - at least 1 full cycle spent in Dispatch
+        // SECOND HALF OF CYCLE
         // =========================
+
+        // 3) Update RS with broadcast results (second half)
+        for (proc_inst_t* inst : broadcasted_this_cycle) {
+            for (proc_inst_t* rs_inst : g_rs) {
+                for (int s = 0; s < 2; ++s) {
+                    if (!rs_inst->src_ready[s] &&
+                        rs_inst->src_tag[s] == inst->tag) {
+                        rs_inst->src_ready[s] = true;
+                    }
+                }
+            }
+            inst->ready_to_retire = true;
+            if (DEBUG_PRINT) {
+                log_event("STATE UPDATE", inst->tag);
+            }
+        }
+
+        // 4) Move from Dispatch queue -> RS (second half - read register file)
         uint64_t rs_occupancy = (uint64_t)g_rs.size();
 
         auto it = g_dispatch_q.begin();
         while (it != g_dispatch_q.end() && rs_occupancy < g_rs_capacity) {
             proc_inst_t* inst = *it;
 
-            // Must stay at least 1 full cycle in dispatch
             if (inst->disp_cycle >= g_cycle) {
-                break; // all later ones have same or larger disp_cycle
+                break;
             }
 
-            // Instruction enters Schedule this cycle
             inst->sched_cycle = g_cycle;
             inst->in_dispatch = false;
             inst->in_rs       = true;
 
-            // Initialize src readiness from register file
+            // Read register file (second half)
             for (int s = 0; s < 2; ++s) {
                 int reg = inst->src_reg[s];
                 if (reg < 0 || reg >= 128) {
@@ -370,7 +378,6 @@ void run_proc(proc_stats_t* p_stats)
                 }
             }
 
-            // For dest reg: mark new producer and not ready
             if (inst->dest_reg >= 0 && inst->dest_reg < 128) {
                 int d = inst->dest_reg;
                 g_reg[d].ready        = false;
@@ -380,19 +387,14 @@ void run_proc(proc_stats_t* p_stats)
             g_rs.push_back(inst);
 
             if (DEBUG_PRINT) {
-                printf("%lu\tSCHEDULED\t%lu\n",
-                       (unsigned long)g_cycle,
-                       (unsigned long)inst->tag);
+                log_event("SCHEDULED", inst->tag);
             }
 
             it = g_dispatch_q.erase(it);
             rs_occupancy++;
         }
 
-        // =========================
         // 5) Move from Fetch latch -> Dispatch
-        //    - they spent 1 cycle in Fetch, now enter Dispatch
-        // =========================
         if (!g_fetch_latch.empty()) {
             for (proc_inst_t* inst : g_fetch_latch) {
                 inst->disp_cycle = g_cycle;
@@ -400,17 +402,13 @@ void run_proc(proc_stats_t* p_stats)
                 g_dispatch_q.push_back(inst);
 
                 if (DEBUG_PRINT) {
-                    printf("%lu\tDISPATCHED\t%lu\n",
-                           (unsigned long)g_cycle,
-                           (unsigned long)inst->tag);
+                    log_event("DISPATCHED", inst->tag);
                 }
             }
             g_fetch_latch.clear();
         }
 
-        // =========================
-        // 6) FETCH new instructions (up to F per cycle)
-        // =========================
+        // 6) FETCH new instructions
         if (more_instructions) {
             for (uint64_t i = 0; i < g_F; ++i) {
                 proc_inst_t temp;
@@ -423,20 +421,14 @@ void run_proc(proc_stats_t* p_stats)
                 inst->fetch_cycle = g_cycle;
 
                 if (DEBUG_PRINT) {
-                    printf("%lu\tFETCHED\t\t%lu\n",
-                           (unsigned long)g_cycle,
-                           (unsigned long)inst->tag);
+                    log_event("FETCHED", inst->tag);  // Extra tab to match reference format
                 }
 
-                // Will enter Dispatch next cycle
                 g_fetch_latch.push_back(inst);
             }
         }
 
-        // =========================
-        // 7) RETIRE / STATE UPDATE completion (free RS)
-        //    - RS entries are freed in "second half" of cycle
-        // =========================
+        // 7) RETIRE (delete from RS - second half)
         if (!g_rs.empty()) {
             auto it_rs = g_rs.begin();
             while (it_rs != g_rs.end()) {
@@ -453,18 +445,14 @@ void run_proc(proc_stats_t* p_stats)
 
         p_stats->retired_instruction += retired_this_cycle;
 
-        // =========================
         // 8) Update dispatch queue stats
-        // =========================
         uint64_t disp_size = (uint64_t)g_dispatch_q.size();
         g_total_disp_size += disp_size;
         if (disp_size > p_stats->max_disp_size) {
             p_stats->max_disp_size = disp_size;
         }
 
-        // =========================
         // 9) Termination condition
-        // =========================
         bool fus_idle = true;
         for (const FuUnit &fu : g_fu_units) {
             if (fu.busy) {
@@ -501,4 +489,19 @@ void complete_proc(proc_stats_t *p_stats)
         p_stats->avg_inst_retired = 0.0f;
         p_stats->avg_inst_fired   = 0.0f;
     }
+
+#ifdef LOCAL_DEBUG
+    // Dump per-instruction timing table to stdout (like gcc.output)
+    printf("INST\tFETCH\tDISP\tSCHED\tEXEC\tSTATE\n");
+    for (size_t i = 0; i < g_all_insts.size(); ++i) {
+        proc_inst_t* inst = g_all_insts[i];
+        printf("%lu\t%lu\t%lu\t%lu\t%lu\t%lu\n",
+               (unsigned long)inst->tag,
+               (unsigned long)inst->fetch_cycle,
+               (unsigned long)inst->disp_cycle,
+               (unsigned long)inst->sched_cycle,
+               (unsigned long)inst->exec_cycle,
+               (unsigned long)inst->state_cycle);
+    }
+#endif
 }
