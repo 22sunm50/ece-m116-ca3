@@ -9,7 +9,7 @@
 // Set this to false before submitting to Gradescope
 // static const bool DEBUG_PRINT = false;
 
-// #define LOCAL_DEBUG 1   // uncomment when debugging locally
+#define LOCAL_DEBUG 1   // uncomment when debugging locally
 
 #ifdef LOCAL_DEBUG
 static const bool DEBUG_PRINT = true;
@@ -30,6 +30,11 @@ static uint64_t g_rs_capacity = 0;
 // =============== Global simulation state ===============
 static uint64_t g_cycle    = 0;   // current cycle (1-based)
 static uint64_t g_next_tag = 1;   // next tag to assign
+
+// RS occupancy as seen by Dispatch (lags real frees by 2 cycles)
+static uint64_t g_rs_occ_for_dispatch = 0;
+// How many RS slots were freed in the last two cycles
+static uint64_t g_rs_freed_delay[2] = {0, 0};
 
 // Dispatch queue (unbounded)
 static std::deque<proc_inst_t*> g_dispatch_q;
@@ -150,6 +155,11 @@ void setup_proc(uint64_t r, uint64_t k0, uint64_t k1, uint64_t k2, uint64_t f)
     g_rs.clear();
     g_fu_units.clear();
 
+    g_rs_occ_for_dispatch = 0;
+    g_rs_freed_delay[0] = 0;
+    g_rs_freed_delay[1] = 0;
+
+
     // Initialize register file: all ready with no producer
     for (int i = 0; i < 128; ++i) {
         g_reg[i].ready        = true;
@@ -207,6 +217,14 @@ void run_proc(proc_stats_t* p_stats)
 
     while (!done) {
         g_cycle++;
+
+        // Apply frees that became visible to Dispatch this cycle.
+        // Freed RS slots are seen by Dispatch with a 2-cycle delay:
+        // - we recorded them into g_rs_freed_delay[1] when they retired
+        // - shift them down every cycle; subtract the ones that were retired 2 cycles ago
+        g_rs_occ_for_dispatch -= g_rs_freed_delay[0];
+        g_rs_freed_delay[0] = g_rs_freed_delay[1];
+        g_rs_freed_delay[1] = 0;
 
         size_t fired_this_cycle   = 0;
         size_t retired_this_cycle = 0;
@@ -347,7 +365,8 @@ void run_proc(proc_stats_t* p_stats)
         }
 
         // 4) Move from Dispatch queue -> RS (second half - read register file)
-        uint64_t rs_occupancy = (uint64_t)g_rs.size();
+        // Use RS occupancy as seen by Dispatch, which lags real frees by 2 cycles.
+        uint64_t rs_occupancy = g_rs_occ_for_dispatch;
 
         auto it = g_dispatch_q.begin();
         while (it != g_dispatch_q.end() && rs_occupancy < g_rs_capacity) {
@@ -392,6 +411,7 @@ void run_proc(proc_stats_t* p_stats)
 
             it = g_dispatch_q.erase(it);
             rs_occupancy++;
+            g_rs_occ_for_dispatch++;   // keep Dispatch's view in sync
         }
 
         // 5) Move from Fetch latch -> Dispatch
@@ -429,6 +449,7 @@ void run_proc(proc_stats_t* p_stats)
         }
 
         // 7) RETIRE (delete from RS - second half)
+        uint64_t freed_this_cycle = 0;
         if (!g_rs.empty()) {
             auto it_rs = g_rs.begin();
             while (it_rs != g_rs.end()) {
@@ -436,12 +457,16 @@ void run_proc(proc_stats_t* p_stats)
                 if (inst->ready_to_retire && !inst->retired) {
                     inst->retired = true;
                     retired_this_cycle++;
+                    freed_this_cycle++;
                     it_rs = g_rs.erase(it_rs);
                 } else {
                     ++it_rs;
                 }
             }
         }
+
+        // These freed RS slots will only be visible to Dispatch in 2 cycles
+        g_rs_freed_delay[1] += freed_this_cycle;
 
         p_stats->retired_instruction += retired_this_cycle;
 
