@@ -9,7 +9,7 @@
 // Set this to false before submitting to Gradescope
 // static const bool DEBUG_PRINT = false;
 
-#define LOCAL_DEBUG 1   // uncomment when debugging locally
+// #define LOCAL_DEBUG 1   // uncomment when debugging locally
 
 #ifdef LOCAL_DEBUG
 static const bool DEBUG_PRINT = true;
